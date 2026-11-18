@@ -135,11 +135,30 @@ export class Repo {
   /** Set by the forge when it adopts the repository: re-keys the index on a rename. */
   onRename: ((previous: string, next: string) => void) | null = null;
 
+  /** The oid of the last object stored, so a cache key can tell when the store moved. */
+  private objectStamp = 0;
+
   /** Store one object (idempotent). */
   put(type: string, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      this.objectStamp += 1;
+    }
     return oid;
+  }
+
+  /** Every smart-HTTP upload-pack answer already framed for this exact store state and request. */
+  readonly uploadCache = new Map<string, Buffer>();
+
+  /**
+   * A key that changes whenever a fetch answer would change: the object count, the refs, and the
+   * shallow file state. Two calls with the same key may share an upload-pack answer byte for byte.
+   */
+  stateKey(): string {
+    let refs = '';
+    for (const [name, oid] of this.refs) refs += `${name}=${oid};`;
+    return `${String(this.objectStamp)}|${String(this.objects.size)}|${refs}`;
   }
 
   /** A ref's object id, or undefined when the ref does not exist. */

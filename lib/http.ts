@@ -50,6 +50,7 @@ const EMPTY = Buffer.alloc(0);
 /** The query object a request without a query string shares (handlers only read it). */
 const NO_QUERY = new URLSearchParams();
 const HEAD_END = Buffer.from('\r\n\r\n', 'ascii');
+const CRLF = Buffer.from('\r\n', 'ascii');
 const CONTINUE = Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'ascii');
 
 const REASONS: Readonly<Record<number, string>> = {
@@ -78,12 +79,6 @@ const REASONS: Readonly<Record<number, string>> = {
 function jsonBody(status: number, body: unknown, headers: Record<string, string> = {}): Handled {
   const text = `${JSON.stringify(body)}\n`;
   return { status, body: Buffer.from(text, 'utf8'), contentType: 'application/json; charset=utf-8', headers };
-}
-
-/** The raw path, without its query string. */
-function pathOf(target: string): string {
-  const cut = target.indexOf('?');
-  return cut < 0 ? target : target.slice(0, cut);
 }
 
 /** Whether the request presented the trial's bearer token. */
@@ -189,15 +184,16 @@ function parseRequest(buffer: Buffer): ParseResult | null {
     if (buffer.length > 128 * 1024) return { request: null, consumed: buffer.length, error: 'request head is too large' };
     return null;
   }
-  const head = buffer.toString('latin1', 0, end);
-  const lines = head.split('\r\n');
-  const requestLine = lines[0] ?? '';
-  const firstSpace = requestLine.indexOf(' ');
-  const secondSpace = requestLine.indexOf(' ', firstSpace + 1);
-  if (firstSpace <= 0 || secondSpace <= firstSpace) return { request: null, consumed: end + 4, error: 'malformed request line' };
-  const method = requestLine.slice(0, firstSpace).toUpperCase();
-  const target = requestLine.slice(firstSpace + 1, secondSpace);
-  const version = requestLine.slice(secondSpace + 1);
+  const requestLineEnd = buffer.indexOf(CRLF);
+  if (requestLineEnd < 0 || requestLineEnd > end) return { request: null, consumed: end + 4, error: 'malformed request line' };
+  const firstSpace = buffer.indexOf(32, 0);
+  const secondSpace = firstSpace < 0 ? -1 : buffer.indexOf(32, firstSpace + 1);
+  if (firstSpace <= 0 || firstSpace >= requestLineEnd || secondSpace <= firstSpace || secondSpace >= requestLineEnd) {
+    return { request: null, consumed: end + 4, error: 'malformed request line' };
+  }
+  const method = buffer.toString('latin1', 0, firstSpace).toUpperCase();
+  const target = buffer.toString('latin1', firstSpace + 1, secondSpace);
+  const version = buffer.toString('latin1', secondSpace + 1, requestLineEnd);
   if (!version.startsWith('HTTP/1.')) return { request: null, consumed: end + 4, error: 'unsupported HTTP version' };
 
   let contentLength = -1;
@@ -205,27 +201,34 @@ function parseRequest(buffer: Buffer): ParseResult | null {
   let keepAlive = !version.startsWith('HTTP/1.0');
   let expectContinue = false;
   const headers: Record<string, string> = {};
-  for (let index = 1; index < lines.length; index += 1) {
-    const line = lines[index] as string;
-    if (line === '') continue;
-    const colon = line.indexOf(':');
-    if (colon <= 0) continue;
-    const name = line.slice(0, colon).trim().toLowerCase();
-    const value = line.slice(colon + 1).trim();
-    headers[name] = value;
-    if (name === 'content-length') {
-      const parsedLength = Number(value);
-      contentLength = Number.isFinite(parsedLength) && parsedLength >= 0 ? parsedLength : -1;
-    } else if (name === 'transfer-encoding' && value.toLowerCase().includes('chunked')) {
-      chunked = true;
-    } else if (name === 'connection') {
-      const lowered = value.toLowerCase();
-      if (lowered.includes('close')) keepAlive = false;
-      else if (lowered.includes('keep-alive')) keepAlive = true;
-    } else if (name === 'expect' && value.toLowerCase() === '100-continue') {
-      expectContinue = true;
+  let lineStart = requestLineEnd + 2;
+  while (lineStart < end) {
+    const lineEnd = buffer.indexOf(CRLF, lineStart);
+    if (lineEnd < 0 || lineEnd > end) break;
+    const colon = buffer.indexOf(58, lineStart);
+    if (colon > lineStart && colon < lineEnd) {
+      const name = buffer.toString('latin1', lineStart, colon).trim().toLowerCase();
+      const value = buffer.toString('latin1', colon + 1, lineEnd).trim();
+      headers[name] = value;
+      if (name === 'content-length') {
+        const parsedLength = Number(value);
+        contentLength = Number.isFinite(parsedLength) && parsedLength >= 0 ? parsedLength : -1;
+      } else if (name === 'transfer-encoding' && value.toLowerCase().includes('chunked')) {
+        chunked = true;
+      } else if (name === 'connection') {
+        const lowered = value.toLowerCase();
+        if (lowered.includes('close')) keepAlive = false;
+        else if (lowered.includes('keep-alive')) keepAlive = true;
+      } else if (name === 'expect' && value.toLowerCase() === '100-continue') {
+        expectContinue = true;
+      }
     }
+    lineStart = lineEnd + 2;
   }
+
+  const queryAt = target.indexOf('?');
+  const path = queryAt < 0 ? target : target.slice(0, queryAt);
+  const query = queryAt < 0 ? '' : target.slice(queryAt + 1);
 
   const bodyStart = end + 4;
   if (chunked) {
@@ -233,7 +236,7 @@ function parseRequest(buffer: Buffer): ParseResult | null {
     if (decoded === null) return null;
     if (typeof decoded === 'string') return { request: null, consumed: decoded === 'too-large' ? buffer.length : bodyStart, error: 'malformed chunked body' };
     return {
-      request: { method, target, path: pathOf(target), query: queryOfTarget(target), headers, body: decoded.body, keepAlive, expectContinue },
+      request: { method, target, path, query, headers, body: decoded.body, keepAlive, expectContinue },
       consumed: decoded.consumed,
       error: null,
     };
@@ -243,7 +246,7 @@ function parseRequest(buffer: Buffer): ParseResult | null {
   if (buffer.length < bodyStart + contentLength) return null;
   const body = contentLength === 0 ? EMPTY : buffer.subarray(bodyStart, bodyStart + contentLength);
   return {
-    request: { method, target, path: pathOf(target), query: queryOfTarget(target), headers, body, keepAlive, expectContinue },
+    request: { method, target, path, query, headers, body, keepAlive, expectContinue },
     consumed: bodyStart + contentLength,
     error: null,
   };
@@ -282,7 +285,7 @@ function decodeChunked(buffer: Buffer, start: number): { body: Buffer; consumed:
   }
 }
 
-/** The bytes one answer becomes on the wire. */
+/** The bytes one answer becomes on the wire, assembled into a single write buffer. */
 function frame(answer: Handled, requestId: string, headOnly: boolean, keepAlive: boolean): Buffer {
   const body = answer.body ?? EMPTY;
   const status = answer.status;
@@ -295,7 +298,10 @@ function frame(answer: Handled, requestId: string, headOnly: boolean, keepAlive:
   head += keepAlive ? 'connection: keep-alive\r\n\r\n' : 'connection: close\r\n\r\n';
   const headBytes = Buffer.from(head, 'latin1');
   if (status === 204 || headOnly || body.length === 0) return headBytes;
-  return Buffer.concat([headBytes, body]);
+  const out = Buffer.allocUnsafe(headBytes.length + body.length);
+  headBytes.copy(out, 0);
+  body.copy(out, headBytes.length);
+  return out;
 }
 
 interface Routed {
